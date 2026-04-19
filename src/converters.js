@@ -108,8 +108,9 @@ function toChatCompletions(internal) {
   if (internal.temperature !== undefined) body.temperature = internal.temperature;
   if (internal.top_p !== undefined) body.top_p = internal.top_p;
   if (internal.stop) body.stop = internal.stop;
-  if (internal.tools) body.tools = internal.tools;
-  if (internal.tool_choice) body.tool_choice = internal.tool_choice;
+  // Translate Anthropic-style tools → OpenAI-style { type, function: { name, description, parameters } }
+  if (internal.tools) body.tools = internal.tools.map(anthropicToolToChatTool);
+  if (internal.tool_choice) body.tool_choice = translateToolChoiceToChat(internal.tool_choice);
   if (internal.n) body.n = internal.n;
   if (internal.presence_penalty !== undefined) body.presence_penalty = internal.presence_penalty;
   if (internal.frequency_penalty !== undefined) body.frequency_penalty = internal.frequency_penalty;
@@ -131,8 +132,9 @@ function toMessages(internal) {
   if (internal.top_p !== undefined) body.top_p = internal.top_p;
   if (internal.top_k !== undefined) body.top_k = internal.top_k;
   if (internal.stop) body.stop_sequences = Array.isArray(internal.stop) ? internal.stop : [internal.stop];
-  if (internal.tools) body.tools = internal.tools;
-  if (internal.tool_choice) body.tool_choice = internal.tool_choice;
+  // Translate OpenAI-style tools → Anthropic-style { name, description, input_schema }
+  if (internal.tools) body.tools = internal.tools.map(chatToolToAnthropicTool);
+  if (internal.tool_choice) body.tool_choice = translateToolChoiceToAnthropic(internal.tool_choice);
   if (internal.metadata) body.metadata = internal.metadata;
   return body;
 }
@@ -565,6 +567,158 @@ function estimateTokens(text) {
 
 function safeParseJson(str) {
   try { return JSON.parse(str); } catch { return str; }
+}
+
+
+// ══════════════════════════════════════════════
+//  TOOL FORMAT TRANSLATORS
+// ══════════════════════════════════════════════
+
+// Anthropic tool → OpenAI tool
+// { name, description, input_schema } → { type, function: { name, description, parameters } }
+function anthropicToolToChatTool(tool) {
+  // Already OpenAI format — has a `function` key or `type: "function"`
+  if (tool.type === "function" || tool.function) return tool;
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description ?? "",
+      parameters: tool.input_schema ?? { type: "object", properties: {} },
+    },
+  };
+}
+
+// OpenAI tool → Anthropic tool
+// { type, function: { name, description, parameters } } → { name, description, input_schema }
+function chatToolToAnthropicTool(tool) {
+  // Already Anthropic format — has input_schema
+  if (tool.input_schema) return tool;
+  const fn = tool.function ?? tool;
+  return {
+    name: fn.name,
+    description: fn.description ?? "",
+    input_schema: fn.parameters ?? { type: "object", properties: {} },
+  };
+}
+
+// tool_choice: Anthropic → OpenAI
+function translateToolChoiceToChat(tc) {
+  if (!tc) return undefined;
+  if (typeof tc === "string") {
+    // "auto" | "any" | "none"
+    if (tc === "any") return "required";
+    return tc; // "auto", "none" are identical
+  }
+  if (tc.type === "tool" && tc.name) return { type: "function", function: { name: tc.name } };
+  if (tc.type === "auto") return "auto";
+  if (tc.type === "any") return "required";
+  if (tc.type === "none") return "none";
+  return tc;
+}
+
+// tool_choice: OpenAI → Anthropic
+function translateToolChoiceToAnthropic(tc) {
+  if (!tc) return undefined;
+  if (tc === "auto") return { type: "auto" };
+  if (tc === "none") return { type: "none" };  // Anthropic doesn't have "none" but pass through
+  if (tc === "required") return { type: "any" };
+  if (typeof tc === "object" && tc.type === "function") return { type: "tool", name: tc.function?.name };
+  return tc;
+}
+
+// ══════════════════════════════════════════════
+//  MESSAGE CONTENT: tool_use / tool_result blocks
+// ══════════════════════════════════════════════
+
+// Build chat messages, translating Anthropic tool_use/tool_result blocks → OpenAI format
+function buildChatMessages(internal) {
+  const msgs = [];
+  if (internal.system) msgs.push({ role: "system", content: internal.system });
+  for (const m of internal.messages) {
+    if (m.role === "system") continue;
+
+    // Anthropic assistant message with tool_use blocks
+    if (m.role === "assistant" && Array.isArray(m.content)) {
+      const textParts = m.content.filter(b => b.type === "text").map(b => b.text).join("");
+      const toolCalls = m.content
+        .filter(b => b.type === "tool_use")
+        .map(b => ({
+          id: b.id ?? ("call_" + randomId()),
+          type: "function",
+          function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+        }));
+      const msg = { role: "assistant", content: textParts || null };
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      msgs.push(msg);
+      continue;
+    }
+
+    // Anthropic user message with tool_result blocks
+    if (m.role === "user" && Array.isArray(m.content) && m.content.some(b => b.type === "tool_result")) {
+      for (const block of m.content) {
+        if (block.type === "tool_result") {
+          msgs.push({
+            role: "tool",
+            tool_call_id: block.tool_use_id,
+            content: typeof block.content === "string"
+              ? block.content
+              : (Array.isArray(block.content) ? block.content.map(b => b.text ?? "").join("") : ""),
+          });
+        } else if (block.type === "text" && block.text) {
+          msgs.push({ role: "user", content: block.text });
+        }
+      }
+      continue;
+    }
+
+    msgs.push({ role: m.role, content: flattenContent(m.content) });
+  }
+  return msgs;
+}
+
+// Build Anthropic messages, translating OpenAI tool_calls/tool role → Anthropic format
+function buildAnthropicMessages(internal) {
+  const out = [];
+  for (const m of internal.messages) {
+    if (m.role === "system") continue;
+
+    // OpenAI assistant message with tool_calls
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      const blocks = [];
+      if (m.content) blocks.push({ type: "text", text: m.content });
+      for (const tc of m.tool_calls) {
+        blocks.push({
+          type: "tool_use",
+          id: tc.id,
+          name: tc.function?.name,
+          input: safeParseJson(tc.function?.arguments ?? "{}"),
+        });
+      }
+      out.push({ role: "assistant", content: blocks });
+      continue;
+    }
+
+    // OpenAI tool result message
+    if (m.role === "tool") {
+      // Anthropic expects tool_result inside a user turn
+      const last = out[out.length - 1];
+      const resultBlock = {
+        type: "tool_result",
+        tool_use_id: m.tool_call_id,
+        content: m.content ?? "",
+      };
+      if (last?.role === "user" && Array.isArray(last.content)) {
+        last.content.push(resultBlock);
+      } else {
+        out.push({ role: "user", content: [resultBlock] });
+      }
+      continue;
+    }
+
+    out.push({ role: m.role, content: toAnthropicContent(m.content) });
+  }
+  return out;
 }
 
 module.exports = {
