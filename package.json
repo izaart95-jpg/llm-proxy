@@ -1,0 +1,26 @@
+{
+  "name": "llm-proxy",
+  "version": "1.0.0",
+  "description": "Universal LLM proxy that bridges OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses API — with full streaming support",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "llm", "proxy", "openai", "anthropic",
+    "chat-completions", "messages-api", "responses-api", "streaming", "litellm"
+  ],
+  "author": "Izaart95-jpg",
+  "license": "",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "node-fetch": "^3.3.2"
+  }
+}
